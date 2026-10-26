@@ -28,6 +28,7 @@
 
 
 import math
+import os
 from typing import Type, Tuple, Optional
 from types import SimpleNamespace
 
@@ -358,6 +359,21 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.init_row_max = -float("inf")
         # TMEM corr stage: 4 32-bit cols (row_sum, row_max, corr, no_corr).
         self.tmem_corr_stage_cols = 4
+        # V tail sanitizer. The softmax masks P for key_pos >= K, but P@V still
+        # reads whole TMA-loaded V rows there (the rest of the last page, and
+        # the unowned second page of a 128-token tile). Stale non-finite bytes
+        # in those rows turn the output into NaN via 0 * NaN. When enabled, the
+        # rows with key_pos >= K of a request's final k-tile are zeroed in smem
+        # before mma_pv. Each CTA zeroes its own half of the latent columns from
+        # its mma_pv warp (idle on the peer CTA), synchronized by a two-mbarrier
+        # handshake. Non-boundary tiles are unchanged.
+        self.zero_v_tail = os.environ.get("FLASHINFER_MLA_ZERO_V_TAIL", "1") != "0"
+        # 1: wait V then P on every tile so the boundary sanitize overlaps the
+        #    softmax (cheaper boundary tile, but changes the order everywhere).
+        # 0: keep the stock P-then-V order and sanitize after both waits.
+        self.zero_v_tail_v_first = (
+            os.environ.get("FLASHINFER_MLA_ZERO_V_TAIL_V_FIRST", "1") != "0"
+        )
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the MLA kernel operation.
@@ -783,6 +799,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             self.v_dtype,
             (self.iterations_pv_k * self.iterations_pv_n * self.load_v_stage),
         )
+        # (latent_col, key_in_subtile, sub_buffer) view of this CTA's V smem,
+        # sub_buffer = acc_stage + iterations_pv_n * (p_stage + iterations_pv_k
+        # * stage) -- the same buffer order load_tma_v_one_k_tile writes.
+        vc_smem_layout_flat = vc_smem_layout_for_tma
         vc_smem_layout_for_tma = cute.tiled_divide(
             vc_smem_layout_for_tma,
             (
@@ -910,6 +930,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             p_mma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.p_mma_stage * 2]
             p_cor_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.p_cor_stage * 2]
             mma_o_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_o_stage * 2]
+            # V tail sanitizer handshake (leader -> peer: V landed; peer ->
+            # leader: peer half zeroed). Count 1 each, one phase per boundary tile.
+            vfix_ready_mbar_ptr: cutlass.Int64
+            vfix_done_mbar_ptr: cutlass.Int64
 
             # Smem tensors
             smem_p: cute.struct.Align[
@@ -997,6 +1021,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             kc_latent_smem_layout_for_tma,
             kc_rope_smem_layout_for_tma,
             vc_smem_layout_for_tma,
+            vc_smem_layout_flat,
             cta_layout_vmnk,
             tile_sched_params,
             SplitKVKernelSharedStorage,
@@ -1107,6 +1132,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         kc_latent_smem_layout_for_tma: Optional[cute.ComposedLayout],
         kc_rope_smem_layout_for_tma: Optional[cute.ComposedLayout],
         vc_smem_layout_for_tma: Optional[cute.ComposedLayout],
+        vc_smem_layout_flat: cute.ComposedLayout,
         cta_layout_vmnk: cute.Layout,
         tile_sched_params: MLAStaticTileSchedulerParams,
         SharedStorage: cutlass.Constexpr,
@@ -1256,6 +1282,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         mma_o_pipeline = self.make_and_init_mma_o_pipeline(
             storage.mma_o_mbar_ptr.data_ptr(), cta_layout_vmnk
         )
+        # Read the struct fields here, outside any runtime `if`: `storage` is a
+        # trace-time struct and cannot be carried into a dynamic branch.
+        vfix_ready_mbar = storage.vfix_ready_mbar_ptr.ptr
+        vfix_done_mbar = storage.vfix_done_mbar_ptr.ptr
+        if cutlass.const_expr(self.zero_v_tail):
+            # Initialized before pipeline_init_arrive so the init fence and the
+            # cluster barrier below publish them to the peer CTA.
+            if warp_idx == self.mma_pv_warp_id:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_init(vfix_ready_mbar, 1)
+                    cute.arch.mbarrier_init(vfix_done_mbar, 1)
 
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mnk, is_relaxed=True)
@@ -1289,6 +1326,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
         sVC_for_tma = storage.smem_vc.get_tensor(
             vc_smem_layout_for_tma.outer, swizzle=vc_smem_layout_for_tma.inner
+        )
+        # (latent_col, key_in_subtile, sub_buffer) view for the V tail sanitizer.
+        sVC_flat = storage.smem_vc.get_tensor(
+            vc_smem_layout_flat.outer, swizzle=vc_smem_layout_flat.inner
         )
         # (MMA, MMA_H, MMA_K)
         sP = storage.smem_p.get_tensor(
@@ -1530,6 +1571,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             mma_o_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.mma_o_stage
             )
+            # Parity of the vfix handshake mbarriers; both CTAs walk the same
+            # work tiles, so both flip it on exactly the same boundary tiles.
+            vfix_phase = cutlass.Int32(0)
+            peer_cta_rank = cute.arch.block_idx_in_cluster() ^ 1
             tile_sched = create_mla_static_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
@@ -1558,26 +1603,34 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         tmem_ptr=tmem_ptr,
                         is_leader_cta=is_leader_cta,
                         L=mCL.shape[1],
+                        K=cache_seqs[blk_coord[2]],
+                        vfix_ready_mbar=vfix_ready_mbar,
+                        vfix_done_mbar=vfix_done_mbar,
+                        peer_cta_rank=peer_cta_rank,
                     )
                     mma_pv_only_params = SimpleNamespace(
                         p_mma_pipeline=p_mma_pipeline,
                         mma_o_pipeline=mma_o_pipeline,
                         sP=sP,
                         sVC=sVC,
+                        sVC_flat=sVC_flat,
                     )
                     (
                         tiled_mma_pv,
                         load_v_consumer_state,
                         p_mma_consumer_state,
                         mma_o_producer_state,
+                        vfix_phase,
                     ) = self.mma_pv_warp_body(
                         mma_pv_common_params,
                         mma_pv_only_params,
+                        k_index,
                         k_tile_count,
                         tiled_mma_pv,
                         load_v_consumer_state,
                         p_mma_consumer_state,
                         mma_o_producer_state,
+                        vfix_phase,
                     )
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
@@ -2686,22 +2739,28 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self,
         common_params: SimpleNamespace,
         pv_params: SimpleNamespace,
+        k_index: cutlass.Int32,
         k_tile_count: cutlass.Int32,
         tiled_mma_pv: cute.TiledMma,
         load_v_consumer_state: pipeline.PipelineState,
         p_mma_consumer_state: pipeline.PipelineState,
         mma_o_producer_state: pipeline.PipelineState,
+        vfix_phase: cutlass.Int32,
     ) -> tuple[
         cute.TiledMma,
         pipeline.PipelineState,
         pipeline.PipelineState,
         pipeline.PipelineState,
+        cutlass.Int32,
     ]:
         """PV-only MMA warp body (W11). Runs K mma_pv calls — one per k-tile.
 
         W11 owns TMEM lifetime; allocate/free happen in the caller __call__
         branch around this loop. ACCUMULATE=False is set once before the loop;
         each mma_pv accumulates into the same TMEM O region across k-tiles.
+
+        With zero_v_tail, the peer CTA's W11 (otherwise idle) walks the same
+        k-tiles and zeroes its half of the boundary tile's V tail rows.
         """
         tOrP = tiled_mma_pv.make_fragment_A(pv_params.sP)
         tOrVC = tiled_mma_pv.make_fragment_B(pv_params.sVC)
@@ -2735,22 +2794,159 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     load_v_consumer_state,
                     p_mma_consumer_state,
                     mma_o_producer_state,
+                    vfix_phase,
                 ) = self.mma_pv(
                     common_params,
                     pv_params,
+                    k_index,
                     tiled_mma_pv,
                     load_v_consumer_state,
                     p_mma_consumer_state,
                     mma_o_producer_state,
+                    vfix_phase,
                 )
+                k_index += 1
                 k_tile_count -= 1
+        else:
+            if cutlass.const_expr(self.zero_v_tail):
+                # The peer's own load_v full barrier is never armed (only the
+                # leader CTA expects the 2-CTA TMA bytes), so this state is used
+                # only for its stage index; it must never be waited on here.
+                # Only plain scalars/tensors/pointers enter the runtime branches.
+                vfix_K = common_params.K
+                vfix_sVC = pv_params.sVC_flat
+                vfix_ready = common_params.vfix_ready_mbar
+                vfix_done = common_params.vfix_done_mbar
+                vfix_peer = common_params.peer_cta_rank
+                while k_tile_count > 0:
+                    vfix_stage = load_v_consumer_state.index
+                    if self.is_v_tail_tile(k_index, vfix_K):
+                        vfix_phase = self.peer_zero_v_tail(
+                            vfix_sVC,
+                            k_index,
+                            vfix_K,
+                            vfix_stage,
+                            vfix_ready,
+                            vfix_done,
+                            vfix_peer,
+                            vfix_phase,
+                        )
+                    # Mirrors the leader's load_v consumer stage index.
+                    load_v_consumer_state.advance()
+                    k_index += 1
+                    k_tile_count -= 1
 
         return (  # type: ignore[return-value]
             tiled_mma_pv,
             load_v_consumer_state,
             p_mma_consumer_state,
             mma_o_producer_state,
+            vfix_phase,
         )
+
+    @cute.jit
+    def is_v_tail_tile(self, k_index: cutlass.Int32, K: cutlass.Int32):
+        """True for the k-tile that holds keys at or beyond K (the request's
+        final, partial tile). Fully valid tiles never need V sanitizing."""
+        return (k_index + 1) * self.mma_qk_tiler[1] > K
+
+    @cute.jit
+    def zero_v_tail_rows(
+        self,
+        sVC_flat: cute.Tensor,
+        k_index: cutlass.Int32,
+        K: cutlass.Int32,
+        vc_stage: cutlass.Int32,
+    ):
+        """Zero this CTA's V smem rows with key_pos >= K for one load_v stage.
+
+        Called by all 32 lanes of a W11 warp. sVC_flat is
+        (latent_col, key_in_subtile, sub_buffer); each sub-buffer holds
+        mma_pv_tiler[2] keys starting at k_index*128 + p_stage*mma_pv_tiler[2].
+        Stores are 16-element (16 B for fp8) vectors, which a 128B swizzle keeps
+        contiguous, so autovec_copy emits st.shared.v4.
+        """
+        vec = 16
+        n_cols = cute.size(sVC_flat, mode=[0])
+        sub_k = self.mma_pv_tiler[2]
+        vecs_per_row = n_cols // vec
+        sVC_vec = cute.flat_divide(sVC_flat, (vec,))
+        zero_frag = cute.make_rmem_tensor(cute.make_layout(vec), self.v_dtype)
+        zero_frag.fill(0.0)
+        lane = cute.arch.lane_idx()
+        first_bad = K - k_index * self.mma_qk_tiler[1]
+        for p_stage in cutlass.range_constexpr(self.iterations_pv_k):
+            valid = cutlass.min(
+                cutlass.max(first_bad - p_stage * sub_k, cutlass.Int32(0)),
+                cutlass.Int32(sub_k),
+            )
+            n_items = (sub_k - valid) * vecs_per_row
+            for acc_stage in cutlass.range_constexpr(self.iterations_pv_n):
+                buf = acc_stage + self.iterations_pv_n * (
+                    p_stage + self.iterations_pv_k * vc_stage
+                )
+                item = lane
+                while item < n_items:
+                    key = valid + item // vecs_per_row
+                    col_vec = item % vecs_per_row
+                    cute.autovec_copy(
+                        zero_frag, sVC_vec[None, col_vec, key, buf]
+                    )
+                    item += cute.arch.WARP_SIZE
+
+    @cute.jit
+    def leader_zero_v_tail(
+        self,
+        sVC_flat: cute.Tensor,
+        k_index: cutlass.Int32,
+        K: cutlass.Int32,
+        vc_stage: cutlass.Int32,
+        ready_mbar,
+        done_mbar,
+        peer_cta_rank: cutlass.Int32,
+        vfix_phase: cutlass.Int32,
+    ) -> cutlass.Int32:
+        """Leader W11, after load_v consumer_wait for a boundary tile: release
+        the peer, zero the leader half, then wait for the peer half.
+
+        Ordering mirrors the existing P handoff (generic smem store ->
+        fence_view_async_shared -> mbarrier arrive -> leader MMA wait). The
+        cluster acq_rel fences carry "V TMA has landed" from the leader's
+        load_v wait to the peer before it overwrites its half.
+        """
+        cute.arch.fence_acq_rel_cluster()
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive(ready_mbar, peer_cta_rank)
+        self.zero_v_tail_rows(sVC_flat, k_index, K, vc_stage)
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
+        cute.arch.mbarrier_wait(done_mbar, vfix_phase)
+        cute.arch.fence_acq_rel_cluster()
+        return vfix_phase ^ 1
+
+    @cute.jit
+    def peer_zero_v_tail(
+        self,
+        sVC_flat: cute.Tensor,
+        k_index: cutlass.Int32,
+        K: cutlass.Int32,
+        vc_stage: cutlass.Int32,
+        ready_mbar,
+        done_mbar,
+        peer_cta_rank: cutlass.Int32,
+        vfix_phase: cutlass.Int32,
+    ) -> cutlass.Int32:
+        """Peer W11: wait until the leader has seen this tile's V land, zero
+        the peer half, publish it to the async proxy, signal the leader."""
+        cute.arch.mbarrier_wait(ready_mbar, vfix_phase)
+        cute.arch.fence_acq_rel_cluster()
+        self.zero_v_tail_rows(sVC_flat, k_index, K, vc_stage)
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
+        cute.arch.fence_acq_rel_cluster()
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive(done_mbar, peer_cta_rank)
+        return vfix_phase ^ 1
 
     @cute.jit
     def mma_qk(
@@ -2837,15 +3033,18 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self,
         common_params: SimpleNamespace,
         pv_params: SimpleNamespace,
+        k_index: cutlass.Int32,
         tiled_mma_pv: cute.TiledMma,
         load_v_consumer_state: pipeline.PipelineState,
         p_mma_consumer_state: pipeline.PipelineState,
         mma_o_producer_state: pipeline.PipelineState,
+        vfix_phase: cutlass.Int32,
     ) -> tuple[
         cute.TiledMma,
         pipeline.PipelineState,
         pipeline.PipelineState,
         pipeline.PipelineState,
+        cutlass.Int32,
     ]:
         """Compute one k-tile of mma for P*V. Updates the tiled mma pv and pipeline states.
 
@@ -2866,12 +3065,43 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :rtype: tuple[cute.TiledMma, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
         """
 
-        pv_params.p_mma_pipeline.consumer_wait(p_mma_consumer_state)
         load_v_pipeline = common_params.load_v_pipeline
         accumulate_flag = tiled_mma_pv.get(tcgen05.Field.ACCUMULATE)
         mma_o_pipeline = pv_params.mma_o_pipeline
 
-        load_v_pipeline.consumer_wait(load_v_consumer_state)
+        if cutlass.const_expr(self.zero_v_tail):
+            # Pipeline calls stay outside the runtime `if` below: pipeline
+            # objects cannot be carried through a dynamic branch.
+            if cutlass.const_expr(self.zero_v_tail_v_first):
+                # V before P: V loading never depends on P, so this cannot
+                # deadlock; the boundary sanitize overlaps the softmax.
+                load_v_pipeline.consumer_wait(load_v_consumer_state)
+            else:
+                # Stock order; the sanitize runs once both have arrived.
+                pv_params.p_mma_pipeline.consumer_wait(p_mma_consumer_state)
+                load_v_pipeline.consumer_wait(load_v_consumer_state)
+            vfix_stage = load_v_consumer_state.index
+            vfix_K = common_params.K
+            vfix_sVC = pv_params.sVC_flat
+            vfix_ready = common_params.vfix_ready_mbar
+            vfix_done = common_params.vfix_done_mbar
+            vfix_peer = common_params.peer_cta_rank
+            if self.is_v_tail_tile(k_index, vfix_K):
+                vfix_phase = self.leader_zero_v_tail(
+                    vfix_sVC,
+                    k_index,
+                    vfix_K,
+                    vfix_stage,
+                    vfix_ready,
+                    vfix_done,
+                    vfix_peer,
+                    vfix_phase,
+                )
+            if cutlass.const_expr(self.zero_v_tail_v_first):
+                pv_params.p_mma_pipeline.consumer_wait(p_mma_consumer_state)
+        else:
+            pv_params.p_mma_pipeline.consumer_wait(p_mma_consumer_state)
+            load_v_pipeline.consumer_wait(load_v_consumer_state)
         vc_stage = load_v_consumer_state.index
         for acc_stage in range(self.iterations_pv_n):
             mma_o_pipeline.producer_acquire(mma_o_producer_state)
@@ -2907,6 +3137,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             load_v_consumer_state,
             p_mma_consumer_state,
             mma_o_producer_state,
+            vfix_phase,
         )
 
     @cute.jit
