@@ -4900,7 +4900,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 ),
             )
             acc_lse_iter = cute.recast_ptr(
-                workspace.iterator + cute.cosize(acc_o_layout) * acc_dtype.width // 8,
+                workspace.iterator + cute.cosize(acc_o_layout) * (acc_dtype.width // 8),
                 dtype=acc_dtype,
             )
             acc_lse = cute.make_tensor(acc_lse_iter, acc_lse_layout)
