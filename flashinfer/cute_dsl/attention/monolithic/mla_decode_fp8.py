@@ -154,6 +154,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         reducer_max_splits: int = MAX_SPLITS,
         enable_dcp: bool = False,
         cp_world: int = 1,
+        cp_interleave: int = 1,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -198,8 +199,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             masking over a cyclic rank-local KV shard.
         :type enable_dcp: bool
         :param cp_world: Compile-time DCP world size. Rank-local key ``k`` maps
-            to global key ``k * cp_world + cp_rank``.
+            to global key ``k * cp_world + cp_rank`` when ``cp_interleave == 1``.
         :type cp_world: int
+        :param cp_interleave: Compile-time number of consecutive global keys a
+            rank owns before ownership passes to the next rank. ``1`` is
+            token-cyclic DCP; larger values are block-interleaved DCP, where
+            local key ``k`` maps to global key
+            ``(k // I) * cp_world * I + cp_rank * I + k % I``.
+        :type cp_interleave: int
         """
 
         self.latent_dim = 512
@@ -236,8 +243,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             raise ValueError(
                 "cp_world must be 1 when decode context parallelism is disabled"
             )
+        if cp_interleave < 1:
+            raise ValueError(f"cp_interleave must be positive, got {cp_interleave}")
+        if not enable_dcp and cp_interleave != 1:
+            raise ValueError(
+                "cp_interleave must be 1 when decode context parallelism is disabled"
+            )
         self.enable_dcp = enable_dcp
         self.cp_world = cp_world
+        self.cp_interleave = cp_interleave
         self.num_heads = num_heads
         self.seq_len_q = seq_len_q
         (
@@ -3237,16 +3251,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # M128 tile has the smallest visible rank-local K bound.  Compute
             # that bound once per query tile, then cap it by the physical
             # rank-local K extent so a partial physical tail is still masked.
-            dcp_bound_numerator = cutlass.max(
+            earliest_local_bound = self.dcp_local_bound(
+                common_params,
                 common_params.causal_seq_len
-                - common_params.cp_rank
                 - (common_params.q_len - 1)
                 + first_q_token,
-                cutlass.Int32(0),
             )
-            earliest_local_bound = (
-                dcp_bound_numerator + self.cp_world - 1
-            ) // self.cp_world
             effective_local_bound = cutlass.min(common_params.K, earliest_local_bound)
             first_mask_tile_idx = effective_local_bound // tile_n
         else:
@@ -3775,8 +3785,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     key_pos = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
                     if cutlass.const_expr(self.enable_dcp):
                         mask_threshold = self.num_heads * (
-                            self.cp_world * key_pos
-                            + common_params.cp_rank
+                            self.dcp_global_key(common_params, key_pos)
                             - common_params.causal_seq_len
                             + common_params.q_len
                         )
@@ -3834,8 +3843,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     key_pos = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
                     if cutlass.const_expr(self.enable_dcp):
                         mask_threshold = self.num_heads * (
-                            self.cp_world * key_pos
-                            + common_params.cp_rank
+                            self.dcp_global_key(common_params, key_pos)
                             - common_params.causal_seq_len
                             + common_params.q_len
                         )
@@ -4338,14 +4346,55 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """Whether this row has a visible key in the current local K split."""
         first_local_key = common_params.k_index * self.mma_qk_tiler[1]
         mask_threshold = self.num_heads * (
-            self.cp_world * first_local_key
-            + common_params.cp_rank
+            self.dcp_global_key(common_params, first_local_key)
             - common_params.causal_seq_len
             + self.seq_len_q
         )
         return cute.elem_less(first_local_key, common_params.K) and not cute.elem_less(
             flat_q_row, mask_threshold
         )
+
+    @cute.jit
+    def dcp_global_key(
+        self,
+        common_params: SimpleNamespace,
+        local_key: cutlass.Int32,
+    ) -> cutlass.Int32:
+        """Global position of rank-local key ``local_key`` (monotone in it)."""
+        if cutlass.const_expr(self.cp_interleave == 1):
+            return self.cp_world * local_key + common_params.cp_rank
+        else:
+            block = local_key // self.cp_interleave
+            return (
+                block * (self.cp_world * self.cp_interleave)
+                + common_params.cp_rank * self.cp_interleave
+                + (local_key - block * self.cp_interleave)
+            )
+
+    @cute.jit
+    def dcp_local_bound(
+        self,
+        common_params: SimpleNamespace,
+        global_bound: cutlass.Int32,
+    ) -> cutlass.Int32:
+        """Number of rank-local keys whose global position is < ``global_bound``."""
+        if cutlass.const_expr(self.cp_interleave == 1):
+            numerator = cutlass.max(
+                global_bound - common_params.cp_rank, cutlass.Int32(0)
+            )
+            return (numerator + self.cp_world - 1) // self.cp_world
+        else:
+            cycle = self.cp_world * self.cp_interleave
+            bound = cutlass.max(global_bound, cutlass.Int32(0))
+            full_cycles = bound // cycle
+            tail = (
+                bound - full_cycles * cycle - common_params.cp_rank * self.cp_interleave
+            )
+            tail = cutlass.min(
+                cutlass.max(tail, cutlass.Int32(0)),
+                cutlass.Int32(self.cp_interleave),
+            )
+            return full_cycles * self.cp_interleave + tail
 
     @cute.jit
     def epilogue(

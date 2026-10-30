@@ -160,6 +160,7 @@ def _check_can_implement(
     is_var_split_kv: bool,
     enable_dcp: bool = False,
     cp_world: int = 1,
+    cp_interleave: int = 1,
 ) -> None:
     """Check if the kernel supports the given configuration (cached)."""
     if not isinstance(enable_dcp, bool):
@@ -170,11 +171,29 @@ def _check_can_implement(
         raise ValueError(
             f"cp_world={cp_world} requires enable_dcp=True; disabled DCP uses cp_world=1"
         )
+    if (
+        not isinstance(cp_interleave, int)
+        or isinstance(cp_interleave, bool)
+        or cp_interleave <= 0
+    ):
+        raise ValueError(
+            f"cp_interleave must be a positive integer, got {cp_interleave!r}"
+        )
+    if not enable_dcp and cp_interleave != 1:
+        raise ValueError(
+            f"cp_interleave={cp_interleave} requires enable_dcp=True; "
+            "disabled DCP uses cp_interleave=1"
+        )
 
     mma_qk_tiler_mn = (128, 128)
     mma_pv_tiler_mn = (128, 256)
 
     is_fp8 = torch_dtype == torch.float8_e4m3fn
+    if cp_interleave != 1 and not is_fp8:
+        raise ValueError(
+            f"cp_interleave={cp_interleave} is implemented for FP8 E4M3 only, "
+            f"got {torch_dtype}"
+        )
     KernelClass = (
         BlackwellMultiHeadLatentAttentionForwardFP8
         if is_fp8
@@ -227,6 +246,7 @@ def _get_compiled_mla_kernel(
     enable_pdl: bool = False,
     enable_dcp: bool = False,
     cp_world: int = 1,
+    cp_interleave: int = 1,
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
@@ -274,6 +294,8 @@ def _get_compiled_mla_kernel(
         reducer_max_splits=reducer_max_splits,
         enable_dcp=enable_dcp,
         cp_world=cp_world,
+        # The FP16/BF16 kernel only supports token-cyclic DCP.
+        **({"cp_interleave": cp_interleave} if is_fp8 else {}),
     )
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -472,6 +494,7 @@ def cute_dsl_mla_decode(
     cp_world: int = 1,
     cp_rank: int = 0,
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
+    cp_interleave: int = 1,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
@@ -552,13 +575,21 @@ def cute_dsl_mla_decode(
         Enable static cyclic decode context-parallel masking. DCP returns a
         rank-local attention state and therefore requires ``return_lse=True``.
     cp_world : int
-        Compile-time context-parallel world size. The local cache owns global
-        token positions ``cp_world * local_k + cp_rank``.
+        Compile-time context-parallel world size. With ``cp_interleave=1`` the
+        local cache owns global token positions ``cp_world * local_k + cp_rank``.
     cp_rank : int
         Runtime-uniform context-parallel rank.
     causal_seqlens_kv_global : Optional[torch.Tensor]
         Contiguous CUDA int32 tensor ``[B]`` containing the global exclusive
         causal bound for the newest query token. Required when DCP is enabled.
+    cp_interleave : int
+        Compile-time number of consecutive global token positions each rank
+        owns before ownership advances to the next rank. ``1`` (default) is
+        token-cyclic DCP. A value ``I > 1`` is block-interleaved DCP: local
+        key ``k`` holds global position
+        ``(k // I) * cp_world * I + cp_rank * I + k % I``; with ``I`` equal to
+        the page size, each rank owns whole pages striped from rank zero.
+        Requires ``enable_dcp=True`` and FP8 E4M3 query/KV when not 1.
     Returns
     -------
     torch.Tensor or Tuple[torch.Tensor, torch.Tensor]
@@ -650,6 +681,8 @@ def cute_dsl_mla_decode(
             nondefault.append(f"cp_world={cp_world}")
         if cp_rank != 0:
             nondefault.append(f"cp_rank={cp_rank}")
+        if cp_interleave != 1:
+            nondefault.append(f"cp_interleave={cp_interleave}")
         if causal_seqlens_kv_global is not None:
             nondefault.append("causal_seqlens_kv_global")
         if nondefault:
@@ -815,6 +848,7 @@ def cute_dsl_mla_decode(
         is_var_split_kv=is_var_split_kv,
         enable_dcp=enable_dcp,
         cp_world=cp_world,
+        cp_interleave=cp_interleave,
     )
 
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
@@ -841,6 +875,7 @@ def cute_dsl_mla_decode(
         enable_pdl=enable_pdl,
         enable_dcp=enable_dcp,
         cp_world=cp_world,
+        cp_interleave=cp_interleave,
     )
 
     # Call the kernel
